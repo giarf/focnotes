@@ -319,6 +319,13 @@ final class FloatingNotePanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+final class PointingHandButton: NSButton {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
 final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
     private struct FencedCodeBlock {
         let range: NSRange
@@ -1175,7 +1182,8 @@ final class NoteView: NSView {
     private let paperTintView = NSView()
     private let titleBar = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
-    private let newNoteButton = NSButton()
+    private let closeButton = PointingHandButton()
+    private let newNoteButton = PointingHandButton()
     private let textView = MarkdownTextView()
     private let textRightPadding: CGFloat = 0
     private let fileURL: URL?
@@ -1296,6 +1304,16 @@ final class NoteView: NSView {
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         titleBar.addSubview(titleLabel)
 
+        closeButton.title = "×"
+        closeButton.font = .systemFont(ofSize: 15, weight: .regular)
+        closeButton.contentTintColor = FocnotesPalette.mutedInk.withAlphaComponent(0.24)
+        closeButton.isBordered = false
+        closeButton.toolTip = "Cerrar"
+        closeButton.target = self
+        closeButton.action = #selector(closeNote)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        titleBar.addSubview(closeButton)
+
         newNoteButton.title = "+"
         newNoteButton.font = .systemFont(ofSize: 15, weight: .regular)
         newNoteButton.contentTintColor = FocnotesPalette.mutedInk.withAlphaComponent(0.24)
@@ -1372,6 +1390,10 @@ final class NoteView: NSView {
             titleLabel.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
             titleLabel.leadingAnchor.constraint(equalTo: titleBar.leadingAnchor, constant: 30),
             titleLabel.trailingAnchor.constraint(equalTo: titleBar.trailingAnchor, constant: -30),
+            closeButton.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
+            closeButton.leadingAnchor.constraint(equalTo: titleBar.leadingAnchor, constant: 8),
+            closeButton.widthAnchor.constraint(equalToConstant: 20),
+            closeButton.heightAnchor.constraint(equalToConstant: 20),
             newNoteButton.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
             newNoteButton.trailingAnchor.constraint(equalTo: titleBar.trailingAnchor, constant: -8),
             newNoteButton.widthAnchor.constraint(equalToConstant: 20),
@@ -1527,6 +1549,7 @@ final class NoteView: NSView {
         layer?.borderColor = FocnotesPalette.ink.withAlphaComponent(0.18).cgColor
         layer?.shadowColor = FocnotesPalette.ink.cgColor
         titleLabel.textColor = FocnotesPalette.mutedInk.withAlphaComponent(0.24)
+        closeButton.contentTintColor = titleLabel.textColor
         newNoteButton.contentTintColor = titleLabel.textColor
         textView.textColor = FocnotesPalette.ink.withAlphaComponent(0.86)
         textView.insertionPointColor = FocnotesPalette.accent
@@ -1535,6 +1558,10 @@ final class NoteView: NSView {
 
     @objc private func requestNewNote() {
         newNoteRequested()
+    }
+
+    @objc private func closeNote() {
+        NSApp.terminate(nil)
     }
 
     private func toggleCheckbox(at range: NSRange) {
