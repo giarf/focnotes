@@ -20,7 +20,7 @@ private extension NSColor {
     }
 
     var hexValue: String {
-        guard let rgb = usingColorSpace(.sRGB) else { return "#FFD61F" }
+        guard let rgb = usingColorSpace(.sRGB) else { return "#FFF1A8" }
         return String(
             format: "#%02X%02X%02X",
             Int(round(rgb.redComponent * 255)),
@@ -30,7 +30,7 @@ private extension NSColor {
     }
 
     var rgbComponents255: (red: Int, green: Int, blue: Int) {
-        guard let rgb = usingColorSpace(.sRGB) else { return (255, 214, 31) }
+        guard let rgb = usingColorSpace(.sRGB) else { return (255, 241, 168) }
         return (
             Int(round(rgb.redComponent * 255)),
             Int(round(rgb.greenComponent * 255)),
@@ -68,7 +68,7 @@ private enum NoteTheme: String, CaseIterable {
 
     var color: NSColor {
         switch self {
-        case .yellow: return NSColor(hex: "#FFD61F")!
+        case .yellow: return NSColor(hex: "#FFF1A8")!
         case .dark: return NSColor(hex: "#202127")!
         case .cream: return NSColor(hex: "#F3E7CF")!
         case .sage: return NSColor(hex: "#CFE5D2")!
@@ -89,6 +89,25 @@ private enum FocnotesPalette {
     }
     static var accentBlue: NSColor { paper.isDark ? NSColor(hex: "#77B7FF")! : NSColor(red: 0.02, green: 0.33, blue: 0.82, alpha: 1) }
     static var code: NSColor { accent }
+    static var softHighlight: NSColor {
+        let base = AppPreferences.noteColor
+        if base.isDark {
+            return base.blended(withFraction: 0.2, of: .black) ?? base
+        }
+
+        guard let rgb = base.usingColorSpace(.sRGB) else { return base }
+        var hue: CGFloat = 0
+        var saturation: CGFloat = 0
+        var brightness: CGFloat = 0
+        var alpha: CGFloat = 0
+        rgb.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+        return NSColor(
+            calibratedHue: hue,
+            saturation: min(saturation * 1.8, 1),
+            brightness: brightness,
+            alpha: alpha
+        )
+    }
     static var highlight: NSColor { paper.isDark ? NSColor(hex: "#DCD7A0")! : NSColor(red: 1.0, green: 0.95, blue: 0.63, alpha: 1) }
 }
 
@@ -139,7 +158,7 @@ private enum AppPreferences {
     }
 
     static var customNoteColor: NSColor {
-        NSColor(hex: UserDefaults.standard.string(forKey: customNoteColorKey) ?? "#FFD61F") ?? NoteTheme.yellow.color
+        NSColor(hex: UserDefaults.standard.string(forKey: customNoteColorKey) ?? "#FFF1A8") ?? NoteTheme.yellow.color
     }
 
     static var noteColor: NSColor {
@@ -446,7 +465,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
             x: x,
             y: glyphRect.minY + origin.y - 3,
             width: max(0, min(textContainer.size.width + 10, bounds.maxX - x)),
-            height: max(24, glyphRect.height + 6)
+            height: max(21, glyphRect.height + 3)
         )
     }
 
@@ -703,7 +722,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
         for block in fencedCodeBlocks(in: source) {
             let rect = codeBlockRect(for: block, layoutManager: layoutManager, textContainer: textContainer)
             guard dirtyRect.intersects(rect) else { continue }
-            NSColor.black.withAlphaComponent(FocnotesPalette.paper.isDark ? 0.16 : 0.08).setFill()
+            FocnotesPalette.softHighlight.setFill()
             NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
         }
     }
@@ -734,9 +753,14 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
                 var rect = layoutManager.boundingRect(forGlyphRange: visibleGlyphRange, in: textContainer)
                 rect.origin.x += textContainerOrigin.x
                 rect.origin.y += textContainerOrigin.y
-                rect = rect.insetBy(dx: -3, dy: -1.5)
+                rect = NSRect(
+                    x: rect.minX - 3,
+                    y: rect.minY - 1.5,
+                    width: rect.width + 6,
+                    height: rect.height - 1
+                )
                 guard dirtyRect.intersects(rect) else { return }
-                NSColor.black.withAlphaComponent(FocnotesPalette.paper.isDark ? 0.16 : 0.08).setFill()
+                FocnotesPalette.softHighlight.setFill()
                 NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
             }
         }
@@ -1004,15 +1028,16 @@ final class MarkdownPresentationRenderer {
             delimiterLength += 1
         }
         styleInline(range, openingLength: delimiterLength, closingLength: delimiterLength, attributes: [
-            .font: baseFont,
+            .font: NSFont.monospacedSystemFont(ofSize: baseFont.pointSize, weight: .regular),
+            .foregroundColor: FocnotesPalette.code,
             .focnotesInlineCode: true
         ])
     }
 
     private func styleCodeBlock(_ codeBlock: CodeBlock, range: NSRange) {
         let codeAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: max(11, baseFont.pointSize - 2), weight: .regular),
-            .foregroundColor: FocnotesPalette.ink.withAlphaComponent(0.82)
+            .font: NSFont.monospacedSystemFont(ofSize: baseFont.pointSize, weight: .regular),
+            .foregroundColor: FocnotesPalette.code
         ]
         applyPresentation(codeAttributes, forCharacterRange: range)
 
@@ -1181,6 +1206,7 @@ final class NoteView: NSView {
     private let blurView = NSVisualEffectView()
     private let paperTintView = NSView()
     private let titleBar = NSView()
+    private let titleDivider = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let closeButton = PointingHandButton()
     private let newNoteButton = PointingHandButton()
@@ -1285,7 +1311,12 @@ final class NoteView: NSView {
         titleBar.wantsLayer = true
         titleBar.layer?.cornerRadius = 22
         titleBar.layer?.maskedCorners = [.layerMinXMaxYCorner, .layerMaxXMaxYCorner]
-        titleBar.layer?.backgroundColor = FocnotesPalette.ink.withAlphaComponent(0.025).cgColor
+        titleBar.layer?.backgroundColor = NSColor.clear.cgColor
+
+        titleDivider.translatesAutoresizingMaskIntoConstraints = false
+        titleDivider.wantsLayer = true
+        titleDivider.layer?.backgroundColor = FocnotesPalette.softHighlight.cgColor
+        titleBar.addSubview(titleDivider)
 
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -1387,6 +1418,10 @@ final class NoteView: NSView {
             titleBar.leadingAnchor.constraint(equalTo: leadingAnchor),
             titleBar.trailingAnchor.constraint(equalTo: trailingAnchor),
             titleBar.heightAnchor.constraint(equalToConstant: 24),
+            titleDivider.leadingAnchor.constraint(equalTo: titleBar.leadingAnchor),
+            titleDivider.trailingAnchor.constraint(equalTo: titleBar.trailingAnchor),
+            titleDivider.bottomAnchor.constraint(equalTo: titleBar.bottomAnchor),
+            titleDivider.heightAnchor.constraint(equalToConstant: 1),
             titleLabel.centerYAnchor.constraint(equalTo: titleBar.centerYAnchor),
             titleLabel.leadingAnchor.constraint(equalTo: titleBar.leadingAnchor, constant: 30),
             titleLabel.trailingAnchor.constraint(equalTo: titleBar.trailingAnchor, constant: -30),
@@ -1545,7 +1580,8 @@ final class NoteView: NSView {
     private func applyTheme() {
         blurView.alphaValue = AppPreferences.blurIntensity / 100
         paperTintView.layer?.backgroundColor = FocnotesPalette.paper.cgColor
-        titleBar.layer?.backgroundColor = FocnotesPalette.ink.withAlphaComponent(0.025).cgColor
+        titleBar.layer?.backgroundColor = NSColor.clear.cgColor
+        titleDivider.layer?.backgroundColor = FocnotesPalette.softHighlight.cgColor
         layer?.borderColor = FocnotesPalette.ink.withAlphaComponent(0.18).cgColor
         layer?.shadowColor = FocnotesPalette.ink.cgColor
         titleLabel.textColor = FocnotesPalette.mutedInk.withAlphaComponent(0.24)
@@ -1900,7 +1936,7 @@ private final class ThemePickerView: NSView {
             presets.addArrangedSubview(item)
         }
 
-        configureField(hexField, width: 86, placeholder: "#FFD61F")
+        configureField(hexField, width: 86, placeholder: "#FFF1A8")
         [redField, greenField, blueField].forEach { configureField($0, width: 46, placeholder: "0") }
         colorWell.target = self
         colorWell.action = #selector(changeColorWell(_:))
