@@ -1,4 +1,5 @@
 .build/
 build/
+.screenshots/
 .DS_Store
 *.dmg

@@ -10,6 +10,10 @@
   <img src="https://img.shields.io/badge/Swift-5.9-F05138?style=flat-square&logo=swift&logoColor=white" alt="Swift 5.9">
 </p>
 
+<p align="center">
+  <img src="docs/assets/focnotes-preview.png" width="480" alt="Vista previa de Focnotes">
+</p>
+
 Focnotes se mantiene por encima de otras apps y aparece en todos los escritorios virtuales, parecido al comportamiento de Picture in Picture.
 
 ## Requisitos
