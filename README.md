@@ -99,6 +99,7 @@ El archivo se abre como nota flotante y se guarda automáticamente al escribir. 
 - Redimensionable.
 - Configuración con `⌘,` para controlar la ventana y el tamaño del editor.
 - Atajo global `⌘⇧N`, configurable, para traer la nota al frente y enfocar el editor.
+- Atajo global `⌥D`, configurable, para mostrar u ocultar suavemente la nota activa.
 - Varias notas internas sin archivo, guardadas automáticamente en `UserDefaults`.
 - Menú separado para notas internas y archivos recientes o fijados.
 - Apertura de la última nota interna o archivo al iniciar, configurable y activada por defecto.
