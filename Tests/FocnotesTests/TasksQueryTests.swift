@@ -44,7 +44,7 @@ final class TasksQueryTests: XCTestCase {
         let tasks = try XCTUnwrap(TasksQueryEngine.results(query: "not done", sourceFileURL: file)?.1)
         XCTAssertEqual(tasks.count, 1)
         let task = try XCTUnwrap(tasks.first)
-        XCTAssertEqual(task.fileURL, file)
+        XCTAssertEqual(task.fileURL.resolvingSymlinksInPath(), file.resolvingSymlinksInPath())
         XCTAssertEqual(task.line, 2)
         XCTAssertNotNil(task.due)
         let updated = try TasksQueryEngine.toggle(task)
