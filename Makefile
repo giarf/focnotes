@@ -1,7 +1,7 @@
 .PHONY: build app dmg install uninstall run clean
 
 APP_NAME := Focnotes
-VERSION := 26.7.0
+VERSION := 26.10.0
 BUILD_DIR := build
 APP_DIR := $(BUILD_DIR)/$(APP_NAME).app
 DMG_PATH := $(BUILD_DIR)/$(APP_NAME)-$(VERSION).dmg

@@ -20,6 +20,10 @@ let package = Package(
                 .product(name: "Markdown", package: "swift-markdown")
             ],
             path: "Sources/Focnotes"
+        ),
+        .testTarget(
+            name: "FocnotesTests",
+            dependencies: ["Focnotes"]
         )
     ]
 )

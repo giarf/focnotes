@@ -659,13 +659,13 @@ private final class TitleBarNavigationButton: NSButton {
     }
 }
 
-private enum DailyNoteNavigation: Equatable {
+enum DailyNoteNavigation: Equatable {
     case previous
     case today
     case next
 }
 
-private struct DailyNavigationState {
+struct DailyNavigationState {
     let hasPrevious: Bool
     let hasNext: Bool
     let isToday: Bool
@@ -771,7 +771,8 @@ private enum ObsidianWikiLinkResolver {
     }
 }
 
-private struct VaultTask {
+struct VaultTask {
+    let sourceLine: String
     let description: String
     let isDone: Bool
     let fileURL: URL
@@ -804,7 +805,7 @@ private final class RenderedBlockPayload {
     }
 }
 
-private struct TasksQuery {
+struct TasksQuery {
     enum Grouping: Equatable { case filename, happens }
     enum Sorting { case priority, happens, due }
 
@@ -819,10 +820,27 @@ private struct TasksQuery {
     var hideBacklink = false
 }
 
-private enum TasksQueryEngine {
+enum TasksQueryEngine {
+    // Cache state is owned by the main thread. Only file scanning/parsing runs on indexingQueue.
+    static let indexDidChange = Notification.Name("FocnotesTaskIndexChanged")
+    private static let indexingQueue = DispatchQueue(label: "com.local.focnotes.task-index", qos: .utility)
+    private struct PendingIndex {
+        let id = UUID()
+        var editedFiles: [URL: String] = [:]
+    }
+    private static var pendingIndex: PendingIndex?
     private static var cachedRoot: String?
     private static var cachedAt = Date.distantPast
     private static var cachedTasks: [VaultTask] = []
+    private static let taskExpression = try! NSRegularExpression(pattern: #"^[ \t]*[-*+] \[([ xX-])\] (.*)$"#)
+
+    static var isIndexing: Bool { pendingIndex != nil }
+
+    private enum ToggleError: LocalizedError {
+        case taskChanged
+
+        var errorDescription: String? { "La tarea cambió en el archivo. Actualiza la consulta antes de marcarla." }
+    }
 
     static func results(query source: String, sourceFileURL: URL?) -> (TasksQuery, [VaultTask])? {
         guard let sourceFileURL, let vault = findVault(from: sourceFileURL.deletingLastPathComponent()) else { return nil }
@@ -863,8 +881,14 @@ private enum TasksQueryEngine {
     static func toggle(_ task: VaultTask) throws -> String {
         let content = try String(contentsOf: task.fileURL, encoding: .utf8)
         var lines = content.components(separatedBy: "\n")
-        guard lines.indices.contains(task.line - 1) else { return content }
-        var line = lines[task.line - 1]
+        guard lines.indices.contains(task.line - 1),
+              lines[task.line - 1].trimmingCharacters(in: .newlines).utf8.elementsEqual(task.sourceLine.utf8),
+              task.sourceLine.range(of: #"^[ \t]*[-*+] \[[ xX]\] "#, options: .regularExpression) != nil else {
+            cachedAt = .distantPast
+            throw ToggleError.taskChanged
+        }
+        let hasCarriageReturn = lines[task.line - 1].hasSuffix("\r")
+        var line = task.sourceLine
         if task.isDone {
             line = line.replacingOccurrences(
                 of: #"^(\s*[-*+] )\[[xX]\]"#,
@@ -887,11 +911,31 @@ private enum TasksQueryEngine {
             formatter.dateFormat = "yyyy-MM-dd"
             line += " ✅ " + formatter.string(from: Date())
         }
-        lines[task.line - 1] = line
+        lines[task.line - 1] = line + (hasCarriageReturn ? "\r" : "")
         let updated = lines.joined(separator: "\n")
         try updated.write(to: task.fileURL, atomically: true, encoding: .utf8)
-        cachedAt = .distantPast
+        updateFile(at: task.fileURL, content: updated)
         return updated
+    }
+
+    /// Keep edits visible immediately, including edits made while a disk scan is in flight.
+    static func updateFile(at fileURL: URL, content: String) {
+        guard let cachedRoot else { return }
+        let url = fileURL.standardizedFileURL
+        guard url.path.hasPrefix(cachedRoot + "/") else { return }
+        let vault = URL(fileURLWithPath: cachedRoot)
+        replaceTasks(in: &cachedTasks, fileURL: url, content: content, vault: vault)
+        pendingIndex?.editedFiles[url] = content
+    }
+
+    private static func replaceTasks(in tasks: inout [VaultTask], fileURL: URL, content: String, vault: URL) {
+        tasks.removeAll { $0.fileURL.standardizedFileURL == fileURL }
+        let formatter = taskDateFormatter()
+        for (index, line) in content.components(separatedBy: "\n").enumerated() {
+            if let task = parseTask(line, fileURL: fileURL, line: index + 1, vault: vault, formatter: formatter) {
+                tasks.append(task)
+            }
+        }
     }
 
     private static func compare<T: Comparable>(_ lhs: T, _ rhs: T) -> ComparisonResult {
@@ -991,12 +1035,31 @@ private enum TasksQueryEngine {
     }
 
     private static func indexedTasks(in vault: URL) -> [VaultTask] {
-        if cachedRoot == vault.path, Date().timeIntervalSince(cachedAt) < 3 { return cachedTasks }
-        let tasks = ripgrepTasks(in: vault) ?? nativeTasks(in: vault)
-        cachedRoot = vault.path
-        cachedAt = Date()
-        cachedTasks = tasks
-        return tasks
+        if cachedRoot != vault.path {
+            cachedRoot = vault.path
+            cachedAt = .distantPast
+            cachedTasks = []
+            pendingIndex = nil
+        }
+        if pendingIndex == nil, Date().timeIntervalSince(cachedAt) >= 3 {
+            let pending = PendingIndex()
+            pendingIndex = pending
+            indexingQueue.async {
+                let indexed = ripgrepTasks(in: vault) ?? nativeTasks(in: vault)
+                DispatchQueue.main.async {
+                    guard cachedRoot == vault.path, let current = pendingIndex, current.id == pending.id else { return }
+                    var tasks = indexed
+                    for (url, content) in current.editedFiles {
+                        replaceTasks(in: &tasks, fileURL: url, content: content, vault: vault)
+                    }
+                    cachedTasks = tasks
+                    cachedAt = Date()
+                    pendingIndex = nil
+                    NotificationCenter.default.post(name: indexDidChange, object: vault)
+                }
+            }
+        }
+        return cachedTasks
     }
 
     private static func ripgrepTasks(in vault: URL) -> [VaultTask]? {
@@ -1007,7 +1070,7 @@ private enum TasksQueryEngine {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["--line-number", "--no-heading", "--color", "never", "--glob", "*.md", #"^[ \t]*[-*+] \[[ xX-]\] "#, vault.path]
+        process.arguments = ["--json", "--glob", "*.md", #"^[ \t]*[-*+] \[[ xX-]\] "#, vault.path]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return nil }
@@ -1015,12 +1078,32 @@ private enum TasksQueryEngine {
         process.waitUntilExit()
         guard process.terminationStatus == 0 || process.terminationStatus == 1 else { return nil }
         let output = String(data: data, encoding: .utf8) ?? ""
+        let decoder = JSONDecoder()
+        let formatter = taskDateFormatter()
         return output.split(whereSeparator: \Character.isNewline).compactMap { line in
-            let text = String(line)
-            guard let match = text.range(of: #"^(.*?):(\d+):(.*)$"#, options: .regularExpression) else { return nil }
-            let parts = text[match].split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
-            guard parts.count == 3, let lineNumber = Int(parts[1]) else { return nil }
-            return parseTask(String(parts[2]), fileURL: URL(fileURLWithPath: String(parts[0])), line: lineNumber, vault: vault)
+            guard let event = try? decoder.decode(RipgrepEvent.self, from: Data(line.utf8)),
+                  event.type == "match", let match = event.data,
+                  let path = match.path.text, let text = match.lines.text else { return nil }
+            return parseTask(text, fileURL: URL(fileURLWithPath: path), line: match.line_number, vault: vault, formatter: formatter)
+        }
+    }
+
+    private struct RipgrepEvent: Decodable {
+        struct Text: Decodable { let text: String? }
+        struct Match: Decodable {
+            let path: Text
+            let lines: Text
+            let line_number: Int
+        }
+        let type: String
+        let data: Match?
+
+        private enum CodingKeys: String, CodingKey { case type, data }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            type = try container.decode(String.self, forKey: .type)
+            data = type == "match" ? try container.decode(Match.self, forKey: .data) : nil
         }
     }
 
@@ -1031,18 +1114,19 @@ private enum TasksQueryEngine {
             options: [.skipsHiddenFiles]
         ) else { return [] }
         var tasks: [VaultTask] = []
+        let formatter = taskDateFormatter()
         for case let url as URL in enumerator where url.pathExtension.lowercased() == "md" {
             guard let content = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            for (index, line) in content.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-                if let task = parseTask(String(line), fileURL: url, line: index + 1, vault: vault) { tasks.append(task) }
+            for (index, line) in content.components(separatedBy: "\n").enumerated() {
+                if let task = parseTask(line, fileURL: url, line: index + 1, vault: vault, formatter: formatter) { tasks.append(task) }
             }
         }
         return tasks
     }
 
-    private static func parseTask(_ line: String, fileURL: URL, line lineNumber: Int, vault: URL) -> VaultTask? {
-        guard let expression = try? NSRegularExpression(pattern: #"^[ \t]*[-*+] \[([ xX-])\] (.*)$"#),
-              let match = expression.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else {
+    private static func parseTask(_ rawLine: String, fileURL: URL, line lineNumber: Int, vault: URL, formatter: DateFormatter) -> VaultTask? {
+        let line = rawLine.trimmingCharacters(in: .newlines)
+        guard let match = taskExpression.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else {
             return nil
         }
         let source = line as NSString
@@ -1052,25 +1136,30 @@ private enum TasksQueryEngine {
             ? String(fileURL.path.dropFirst(vault.path.count + 1))
             : fileURL.lastPathComponent
         return VaultTask(
+            sourceLine: line,
             description: description,
             isDone: status.lowercased() == "x",
             fileURL: fileURL,
             relativePath: relative,
             line: lineNumber,
-            due: metadataDate("📅", in: description),
-            scheduled: metadataDate("⏳", in: description),
-            start: metadataDate("🛫", in: description),
+            due: metadataDate("📅", in: description, formatter: formatter),
+            scheduled: metadataDate("⏳", in: description, formatter: formatter),
+            start: metadataDate("🛫", in: description, formatter: formatter),
             priority: priority(in: description)
         )
     }
 
-    private static func metadataDate(_ marker: String, in text: String) -> Date? {
+    private static func metadataDate(_ marker: String, in text: String, formatter: DateFormatter) -> Date? {
         guard let range = text.range(of: marker + #"\s*\{?(\d{4}-\d{2}-\d{2})\}?"#, options: .regularExpression),
               let dateRange = text[range].range(of: #"\d{4}-\d{2}-\d{2}"#, options: .regularExpression) else { return nil }
+        return formatter.date(from: String(text[range][dateRange]))
+    }
+
+    private static func taskDateFormatter() -> DateFormatter {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: String(text[range][dateRange]))
+        return formatter
     }
 
     private static func priority(in text: String) -> Int {
@@ -1094,13 +1183,14 @@ private enum TasksQueryEngine {
 }
 
 final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
-    private struct FencedCodeBlock {
-        let range: NSRange
-        let codeRange: NSRange
-        let language: String?
-        let isClosed: Bool
+    private typealias FencedCodeBlock = MarkdownAnalysis.FencedCodeBlock
+    private let analysisCache = MarkdownAnalysisCache()
+    var markdownAnalysis: MarkdownAnalysis { analysisCache.analysis(for: string) }
 
-        var isTasksQuery: Bool { ["task", "tasks"].contains(language?.lowercased() ?? "") }
+    var activeEditorSelections: [NSRange] {
+        let isWindowActive = (window as? FloatingNotePanel)?.isVisuallyActive ?? window?.isKeyWindow == true
+        guard isWindowActive, window?.firstResponder === self else { return [] }
+        return selectedRanges.map(\.rangeValue)
     }
 
     var checkboxClicked: ((NSRange) -> Void)?
@@ -1167,7 +1257,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
     }
 
     private func selectionTouches(_ range: NSRange) -> Bool {
-        selectedRanges.map(\.rangeValue).contains { selection in
+        activeEditorSelections.contains { selection in
             if selection.length > 0 {
                 return NSIntersectionRange(selection, range).length > 0
             }
@@ -1176,7 +1266,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
     }
 
     private func selectionTouchesLink(_ range: NSRange) -> Bool {
-        selectedRanges.map(\.rangeValue).contains { selection in
+        activeEditorSelections.contains { selection in
             if selection.length > 0 {
                 return NSIntersectionRange(selection, range).length > 0
             }
@@ -1192,58 +1282,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
     }
 
     private func fencedCodeBlocks(in source: NSString) -> [FencedCodeBlock] {
-        let openingPattern = "^[ \\t]{0,3}(`{3,}|~{3,})[^\\r\\n]*(?:\\r?\\n|$)"
-        guard let openingExpression = try? NSRegularExpression(
-            pattern: openingPattern,
-            options: .anchorsMatchLines
-        ) else { return [] }
-
-        var blocks: [FencedCodeBlock] = []
-        var searchLocation = 0
-        while searchLocation < source.length,
-              let opening = openingExpression.firstMatch(
-                in: source as String,
-                range: NSRange(location: searchLocation, length: source.length - searchLocation)
-              ) {
-            let fenceRange = opening.range(at: 1)
-            let fenceCharacter = source.substring(with: NSRange(location: fenceRange.location, length: 1))
-            let escapedCharacter = NSRegularExpression.escapedPattern(for: fenceCharacter)
-            let closingPattern = "^[ \\t]{0,3}\(escapedCharacter){\(fenceRange.length),}[ \\t]*(?:\\r?\\n|$)"
-            let closingExpression = try? NSRegularExpression(
-                pattern: closingPattern,
-                options: .anchorsMatchLines
-            )
-            let closing = closingExpression?.firstMatch(
-                in: source as String,
-                range: NSRange(
-                    location: NSMaxRange(opening.range),
-                    length: source.length - NSMaxRange(opening.range)
-                )
-            )
-            let blockEnd = closing.map { NSMaxRange($0.range) } ?? source.length
-            let codeEnd = closing?.range.location ?? source.length
-
-            blocks.append(FencedCodeBlock(
-                range: NSRange(
-                    location: opening.range.location,
-                    length: blockEnd - opening.range.location
-                ),
-                codeRange: NSRange(
-                    location: NSMaxRange(opening.range),
-                    length: codeEnd - NSMaxRange(opening.range)
-                ),
-                language: {
-                    let infoStart = NSMaxRange(fenceRange)
-                    let infoLength = max(0, NSMaxRange(opening.range) - infoStart)
-                    let info = source.substring(with: NSRange(location: infoStart, length: infoLength))
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    return info.isEmpty ? nil : info.split(whereSeparator: \Character.isWhitespace).first.map(String.init)
-                }(),
-                isClosed: closing != nil
-            ))
-            searchLocation = blockEnd
-        }
-        return blocks
+        analysisCache.analysis(for: source as String).fencedCodeBlocks
     }
 
     var hasClosedTasksQuery: Bool {
@@ -1373,14 +1412,6 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
         for (_, rect) in cachedCheckboxHits {
             addCursorRect(rect, cursor: .pointingHand)
         }
-        if hasClosedTasksQuery {
-            for (payload, rect) in cachedRenderedBlocks {
-                for hit in payload.taskHits {
-                    addCursorRect(taskHitRect(hit.rect, in: rect), cursor: .pointingHand)
-                }
-            }
-            return
-        }
         guard let layoutManager, let textContainer else { return }
         let source = string as NSString
         let fullRange = NSRange(location: 0, length: source.length)
@@ -1451,12 +1482,9 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
         drawBlockQuoteGuides(in: dirtyRect)
         guard let layoutManager, let textContainer else { return }
         let source = string as NSString
-        let fullRange = NSRange(location: 0, length: source.length)
         cachedCheckboxHits.removeAll(keepingCapacity: true)
 
-        let tasks = try? NSRegularExpression(pattern: "(?m)^[ \\t]*([-*+] (\\[[ xX]\\]))(?=[ \\t])")
-        tasks?.enumerateMatches(in: string, range: fullRange) { [weak self] result, _, _ in
-            guard let self, let result else { return }
+        markdownAnalysis.tasks.forEach { result in
             let markerSyntaxRange = result.range(at: 1)
             guard !isProtectedMarkdownRange(markerSyntaxRange) else { return }
             let separatorLength: Int
@@ -1499,9 +1527,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
             }
         }
 
-        let bullets = try? NSRegularExpression(pattern: "(?m)^[ \\t]*([-*+])(?=[ \\t]+(?!\\[[ xX]\\]))")
-        bullets?.enumerateMatches(in: string, range: fullRange) { [weak self] result, _, _ in
-            guard let self, let result else { return }
+        markdownAnalysis.bullets.forEach { result in
             let markerRange = result.range(at: 1)
             guard !isProtectedMarkdownRange(markerRange) else { return }
             let syntaxRange = NSRange(location: markerRange.location, length: min(2, source.length - markerRange.location))
@@ -1600,6 +1626,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
     }
 
     private func drawRenderedBlocks(in dirtyRect: NSRect) {
+        cachedRenderedBlocks.removeAll(keepingCapacity: true)
         guard let layoutManager, let textStorage, textStorage.length > 0 else { return }
         var renderedBlocks: [(RenderedBlockPayload, NSRect)] = []
         var index = 0
@@ -1735,12 +1762,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
             return copyButtonRect(for: blockRect).contains(point)
         }) else { return false }
 
-        var code = source.substring(with: block.codeRange)
-        if code.hasSuffix("\r\n") {
-            code.removeLast(2)
-        } else if code.hasSuffix("\n") || code.hasSuffix("\r") {
-            code.removeLast()
-        }
+        let code = markdownAnalysis.codeToCopy(from: block)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(code, forType: .string)
         return true
@@ -1796,6 +1818,7 @@ final class MarkdownTextView: NSTextView, NSViewToolTipOwner {
 }
 
 final class MarkdownPresentationRenderer {
+    private let analysis: MarkdownAnalysis
     private let source: String
     private let sourceNSString: NSString
     private let textStorage: NSTextStorage
@@ -1803,32 +1826,24 @@ final class MarkdownPresentationRenderer {
     private let baseFont: NSFont
     private let renderWidth: CGFloat
     private let sourceFileURL: URL?
-    private var lineStarts: [String.UTF8View.Index] = []
     private var protectedRanges: [NSRange] = []
 
     init(
-        source: String,
+        analysis: MarkdownAnalysis,
         textStorage: NSTextStorage,
         selections: [NSRange],
         fontSize: CGFloat,
         renderWidth: CGFloat,
         sourceFileURL: URL?
     ) {
-        self.source = source
-        self.sourceNSString = source as NSString
+        self.analysis = analysis
+        self.source = analysis.source
+        self.sourceNSString = analysis.source as NSString
         self.textStorage = textStorage
         self.selections = selections
         self.baseFont = NSFont.systemFont(ofSize: fontSize, weight: .regular)
         self.renderWidth = renderWidth
         self.sourceFileURL = sourceFileURL
-        var index = source.utf8.startIndex
-        lineStarts = [index]
-        while index < source.utf8.endIndex {
-            if source.utf8[index] == 0x0A {
-                lineStarts.append(source.utf8.index(after: index))
-            }
-            index = source.utf8.index(after: index)
-        }
     }
 
     func render(_ markup: Markup) {
@@ -2114,7 +2129,8 @@ final class MarkdownPresentationRenderer {
         if tasks.isEmpty {
             let paragraph = NSMutableParagraphStyle()
             paragraph.alignment = .center
-            ("No hay tareas para esta consulta" as NSString).draw(
+            let message = TasksQueryEngine.isIndexing ? "Buscando tareas…" : "No hay tareas para esta consulta"
+            (message as NSString).draw(
                 in: NSRect(x: 8, y: (height - 16) / 2, width: width - 16, height: 18),
                 withAttributes: [
                     .font: NSFont.systemFont(ofSize: 12, weight: .regular),
@@ -2497,22 +2513,7 @@ final class MarkdownPresentationRenderer {
     }
 
     private func characterRange(for markup: Markup) -> NSRange? {
-        guard let range = markup.range,
-              let lower = stringIndex(for: range.lowerBound),
-              let upper = stringIndex(for: range.upperBound),
-              lower <= upper else { return nil }
-        return NSRange(lower..<upper, in: source)
-    }
-
-    private func stringIndex(for location: SourceLocation) -> String.Index? {
-        guard location.line > 0, location.line <= lineStarts.count, location.column > 0 else { return nil }
-        let lineStart = lineStarts[location.line - 1]
-        guard let utf8Index = source.utf8.index(
-            lineStart,
-            offsetBy: location.column - 1,
-            limitedBy: source.utf8.endIndex
-        ) else { return nil }
-        return String.Index(utf8Index, within: source)
+        analysis.characterRange(for: markup)
     }
 }
 
@@ -2546,12 +2547,13 @@ final class NoteView: NSView {
     private var preferencesObserver: NSObjectProtocol?
     private var titleBarTrackingArea: NSTrackingArea?
     private var focusPreviewWorkItem: DispatchWorkItem?
+    private var taskIndexObserver: NSObjectProtocol?
     private var isMarkdown: Bool {
         guard let extensionName = fileURL?.pathExtension.lowercased(), !extensionName.isEmpty else { return true }
         return extensionName == "md" || extensionName == "markdown"
     }
 
-    fileprivate init(
+    init(
         frame frameRect: NSRect,
         fileURL: URL?,
         initialText: String? = nil,
@@ -2578,6 +2580,9 @@ final class NoteView: NSView {
 
     deinit {
         focusPreviewWorkItem?.cancel()
+        if let taskIndexObserver {
+            NotificationCenter.default.removeObserver(taskIndexObserver)
+        }
         if let preferencesObserver {
             NotificationCenter.default.removeObserver(preferencesObserver)
         }
@@ -2786,7 +2791,19 @@ final class NoteView: NSView {
                 self.updateLivePreview()
             } catch {
                 NSSound.beep()
+                self.updateLivePreview()
             }
+        }
+        taskIndexObserver = NotificationCenter.default.addObserver(
+            forName: TasksQueryEngine.indexDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self, let root = notification.object as? URL,
+                  let fileURL = self.fileURL,
+                  fileURL.standardizedFileURL.path.hasPrefix(root.path + "/"),
+                  self.textView.hasClosedTasksQuery else { return }
+            self.updateLivePreview()
         }
         preferencesObserver = NotificationCenter.default.addObserver(
             forName: AppPreferences.changedNotification,
@@ -2858,11 +2875,14 @@ final class NoteView: NSView {
 
     private func updateTextLayoutWidth() {
         guard let scrollView = textView.enclosingScrollView else { return }
-        textView.frame.size.width = max(scrollView.contentSize.width - textRightPadding, 100)
+        let width = max(scrollView.contentSize.width - textRightPadding, 100)
+        guard textView.frame.width != width || textView.textContainer?.size.width != width else { return }
+        textView.frame.size.width = width
         textView.textContainer?.containerSize = NSSize(
-            width: textView.frame.width,
+            width: width,
             height: CGFloat.greatestFiniteMagnitude
         )
+        scheduleFocusPreviewUpdate()
     }
 
     private func normalizeLegacyMarkdown(_ text: String) -> String {
@@ -2924,16 +2944,16 @@ final class NoteView: NSView {
         if let paragraphStyle = textView.defaultParagraphStyle {
             storage.addAttribute(.paragraphStyle, value: paragraphStyle, range: fullRange)
         }
-        let document = Document(parsing: storage.string, options: [.disableSmartOpts])
+        let analysis = textView.markdownAnalysis
         let renderer = MarkdownPresentationRenderer(
-            source: storage.string,
+            analysis: analysis,
             textStorage: storage,
             selections: activeEditorSelections,
             fontSize: AppPreferences.editorFontSize,
             renderWidth: max(180, (textView.textContainer?.size.width ?? textView.bounds.width) - 10),
             sourceFileURL: fileURL
         )
-        renderer.render(document)
+        renderer.render(analysis.document)
         renderer.renderInlineLinks()
         textView.renderedWikiLinks = renderer.renderWikiLinks()
         applyListDecorations(storage: storage)
@@ -2956,7 +2976,6 @@ final class NoteView: NSView {
     }
 
     private func applyListDecorations(storage: NSTextStorage) {
-        let fullRange = NSRange(location: 0, length: storage.length)
         let source = storage.string as NSString
         let selections = activeEditorSelections
         let selectionTouches: (NSRange) -> Bool = { range in
@@ -2968,9 +2987,7 @@ final class NoteView: NSView {
             }
         }
 
-        let tasks = try? NSRegularExpression(pattern: "(?m)^[ \\t]*([-*+] (\\[[ xX]\\]))(?=[ \\t])")
-        tasks?.enumerateMatches(in: storage.string, range: fullRange) { result, _, _ in
-            guard let result else { return }
+        textView.markdownAnalysis.tasks.forEach { result in
             let syntaxRange = result.range(at: 1)
             guard storage.attribute(
                 .focnotesCodeBlock,
@@ -3017,9 +3034,7 @@ final class NoteView: NSView {
         }
 
 
-        let bullets = try? NSRegularExpression(pattern: "(?m)^[ \\t]*([-*+])(?=[ \\t]+(?!\\[[ xX]\\]))")
-        bullets?.enumerateMatches(in: storage.string, range: fullRange) { result, _, _ in
-            guard let result else { return }
+        textView.markdownAnalysis.bullets.forEach { result in
             let markerRange = result.range(at: 1)
             guard storage.attribute(
                 .focnotesCodeBlock,
@@ -3038,6 +3053,8 @@ final class NoteView: NSView {
     }
 
     private func updateLivePreview() {
+        focusPreviewWorkItem?.cancel()
+        focusPreviewWorkItem = nil
         applyMarkdownHighlighting()
     }
 
@@ -3051,9 +3068,7 @@ final class NoteView: NSView {
     }
 
     private var activeEditorSelections: [NSRange] {
-        let isWindowActive = (window as? FloatingNotePanel)?.isVisuallyActive ?? window?.isKeyWindow == true
-        guard isWindowActive, window?.firstResponder === textView else { return [] }
-        return textView.selectedRanges.map(\.rangeValue)
+        textView.activeEditorSelections
     }
 
     private func applyTheme() {
@@ -3092,16 +3107,16 @@ final class NoteView: NSView {
 
     private func toggleCheckbox(at range: NSRange) {
         let source = textView.string as NSString
-        guard NSMaxRange(range) <= source.length else { return }
+        guard range.location != NSNotFound, range.length == 3, NSMaxRange(range) <= source.length else { return }
         let current = source.substring(with: range)
-        isUpdatingMarkdown = true
+        guard current == "[ ]" || current.lowercased() == "[x]" else { return }
         let valueRange = NSRange(location: range.location + 1, length: 1)
         let value = current.lowercased() == "[x]" ? " " : "x"
+        guard textView.shouldChangeText(in: valueRange, replacementString: value) else { return }
+        isUpdatingMarkdown = true
         textView.textStorage?.replaceCharacters(in: valueRange, with: value)
         isUpdatingMarkdown = false
-        persistText()
-        textView.layoutManager?.invalidateDisplay(forCharacterRange: range)
-        textView.needsDisplay = true
+        textView.didChangeText()
         NSCursor.pointingHand.set()
     }
 
@@ -3126,6 +3141,7 @@ final class NoteView: NSView {
     private func persistText() {
         if let fileURL {
             try? textView.string.write(to: fileURL, atomically: true, encoding: .utf8)
+            TasksQueryEngine.updateFile(at: fileURL, content: textView.string)
         } else {
             textChanged(textView.string)
         }
@@ -3141,8 +3157,9 @@ extension NoteView: NSTextViewDelegate {
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
-        guard !isApplyingHighlighting else { return }
-        updateLivePreview()
+        guard !isApplyingHighlighting, !isUpdatingMarkdown else { return }
+        // Typing also changes the selection. Coalesce that notification with textDidChange.
+        scheduleFocusPreviewUpdate()
     }
 
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {

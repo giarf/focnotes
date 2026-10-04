@@ -33,7 +33,7 @@ El cask verifica el SHA-256 de la descarga y elimina automáticamente la cuarent
 ### DMG
 
 <p align="center">
-  <a href="https://github.com/giarf/focnotes/releases/latest/download/Focnotes-26.7.0.dmg">
+  <a href="https://github.com/giarf/focnotes/releases/latest/download/Focnotes-26.10.0.dmg">
     <img width="200" src="https://github.com/user-attachments/assets/e3179be1-8416-4b8a-b417-743e1ecc67d6" alt="Descargar para macOS">
   </a>
 </p>

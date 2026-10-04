@@ -17,3 +17,6 @@ jobs:
 
       - name: Build
         run: swift build -v
+
+      - name: Test
+        run: swift test
